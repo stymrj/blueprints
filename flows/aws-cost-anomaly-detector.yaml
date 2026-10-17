@@ -1,0 +1,177 @@
+id: aws-cost-anomaly-detector
+namespace: company.finops
+
+description: |
+  Detects AWS cost anomalies by comparing yesterday's spend against the trailing
+  7-day average. Alerts on Slack with a per-service breakdown when the deviation
+  crosses your threshold.
+
+inputs:
+  - id: anomaly_threshold_percent
+    type: INT
+    defaults: 20
+    description: Alert when yesterday's cost deviates this % from the 7-day average.
+  - id: aws_region
+    type: STRING
+    defaults: us-east-1
+    description: AWS region for the CLI calls (Cost Explorer is global, region only sets the endpoint).
+
+variables:
+  slack_webhook_url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+
+tasks:
+  - id: fetch_costs
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Pull daily unblended costs grouped by service for the last 8 days.
+    commands:
+      - |
+        YESTERDAY=$(date -u -d "1 day ago" +%F)
+        WEEK_AGO=$(date -u -d "8 days ago" +%F)
+        aws ce get-cost-and-usage \
+          --time-period Start=$WEEK_AGO,End=$YESTERDAY \
+          --granularity DAILY \
+          --metrics UnblendedCost \
+          --group-by Type=DIMENSION,Key=SERVICE \
+          --output json > /tmp/costs.json
+        echo "COST_FILE=/tmp/costs.json"
+        echo "YESTERDAY=$YESTERDAY"
+    env:
+      AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+      AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+      AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+    outputFiles:
+      - "/tmp/costs.json"
+
+  - id: detect_anomaly
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Compare yesterday vs the 7-day average and decide if it is an anomaly.
+    commands:
+      - |
+        python3 << 'PYEOF'
+        import json
+
+        with open("/tmp/costs.json") as f:
+            data = json.load(f)
+
+        days = data["ResultsByTime"]
+        # last entry = yesterday, previous 7 = baseline
+        yesterday = days[-1]
+        baseline = days[:-1]
+
+        def day_total(d):
+            return sum(float(g["Metrics"]["UnblendedCost"]["Amount"]) for g in d["Groups"])
+
+        y_total = day_total(yesterday)
+        b_avg = sum(day_total(d) for d in baseline) / len(baseline) if baseline else 0
+        deviation = ((y_total - b_avg) / b_avg * 100) if b_avg else 0
+
+        # top 3 services driving yesterday's cost
+        services = sorted(
+            ((g["Keys"][0], float(g["Metrics"]["UnblendedCost"]["Amount"])) for g in yesterday["Groups"]),
+            key=lambda x: x[1], reverse=True
+        )[:3]
+        breakdown = "\n".join(f"- {name}: ${amount:.2f}" for name, amount in services)
+
+        threshold = {{ inputs.anomaly_threshold_percent }}
+        anomaly = abs(deviation) >= threshold
+
+        print(f"ANOMALY_DETECTED={'true' if anomaly else 'false'}")
+        print(f"YESTERDAY_TOTAL={y_total:.2f}")
+        print(f"BASELINE_AVG={b_avg:.2f}")
+        print(f"DEVIATION_PCT={deviation:.1f}")
+        print("BREAKDOWN<<EOF")
+        print(breakdown)
+        print("EOF")
+        PYEOF
+    env:
+      AWS_DEFAULT_REGION: "{{ inputs.aws_region }}"
+
+  - id: notify_anomaly
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.detect_anomaly.vars.ANOMALY_DETECTED == 'true' }}"
+    then:
+      - id: slack_anomaly
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ vars.slack_webhook_url }}"
+        payload: |
+          {
+            "text": ":warning: AWS cost anomaly detected! Yesterday: ${{ outputs.detect_anomaly.vars.YESTERDAY_TOTAL }} vs 7-day avg ${{ outputs.detect_anomaly.vars.BASELINE_AVG }} (deviation: {{ outputs.detect_anomaly.vars.DEVIATION_PCT }}%, threshold: {{ inputs.anomaly_threshold_percent }}%).\nTop services:\n{{ outputs.detect_anomaly.vars.BREAKDOWN }}"
+          }
+    else:
+      - id: log_clean
+        type: io.kestra.plugin.core.log.Log
+        message: "No anomaly. Yesterday: ${{ outputs.detect_anomaly.vars.YESTERDAY_TOTAL }}, 7-day avg: ${{ outputs.detect_anomaly.vars.BASELINE_AVG }}."
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    disabled: true
+    cron: "0 7 * * *"
+    description: Daily at 07:00 UTC — after Cost Explorer refreshes yesterday's data.
+
+extend:
+  title: AWS Cost Anomaly Detector
+  metaTitle: Detect AWS Cost Spikes Automatically | Kestra
+  shortDescription: Compare yesterday's AWS spend against the trailing 7-day average and get a Slack alert with a per-service breakdown when it deviates past your threshold.
+  metaDescription: Catch AWS billing surprises early — daily Cost Explorer comparison with Slack alerts on anomalies, tuned by your own threshold.
+  description: |
+    AWS bills don't spike politely — a forgotten NAT gateway, a runaway batch job, or a misconfigured lifecycle rule shows up as a nasty surprise at month-end. This blueprint catches it the next morning by comparing yesterday's cost against your own trailing 7-day baseline, so anomalies get investigated while they're still cheap to fix.
+
+    ## How it works
+
+    1. A Schedule trigger fires daily at 07:00 UTC (shipped disabled), after Cost Explorer refreshes.
+    2. An AWS CLI task pulls 8 days of daily unblended costs grouped by service.
+    3. A Python analysis step computes the 7-day baseline average, yesterday's total, the deviation percentage, and the top 3 cost-driving services.
+    4. An `If` task routes on the result: a rich Slack alert on anomaly, a quiet log line when spend is normal.
+
+    ## What you get
+
+    - Billing surprises caught within 24 hours, not at month-end.
+    - Alerts tuned to YOUR baseline — no generic thresholds, the 7-day average adapts to your spend pattern.
+    - The top 3 services in every alert, so triage starts with a suspect list.
+    - Silence on normal days: no alert fatigue.
+
+    ## Who it's for
+
+    FinOps practitioners, platform engineers, and startup founders who have been burned by an AWS bill at least once and never want to be surprised again.
+
+    ## Why orchestrate this with Kestra
+
+    A Lambda + EventBridge version of this is scattered, hard to tweak, and invisible. As a Kestra flow the threshold is an input anyone can tune, every run's numbers are logged and auditable, and extending it (new channels, new groupings) is YAML, not a redeploy.
+
+    ## Prerequisites
+
+    - AWS credentials with `ce:GetCostAndUsage` permission (billing console access must be enabled for the IAM principal).
+    - A Slack incoming webhook URL.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS access key for the Cost Explorer API calls.
+    - `AWS_SECRET_ACCESS_KEY`: AWS secret key for the Cost Explorer API calls.
+    - `SLACK_WEBHOOK_URL`: Incoming webhook URL for the anomaly alert.
+
+    ## Quick start
+
+    1. Add the three secrets above to your Kestra namespace.
+    2. Set `anomaly_threshold_percent` to your sensitivity (default 20).
+    3. Run manually once — check whether yesterday was anomalous.
+    4. Enable the daily schedule trigger.
+
+    ## How to extend
+
+    - Group by linked account to find which team caused the spike.
+    - Add a second threshold that pages via PagerDuty for extreme deviations.
+    - Push daily totals to a dashboard for trend visualization.
+
+    ## Links
+
+    - [Kestra AWS plugins](https://kestra.io/plugins)
+    - [Kestra Slack plugins](https://kestra.io/plugins)
+    - [Cost Explorer get-cost-and-usage API](https://docs.aws.amazon.com/cli/latest/reference/ce/get-cost-and-usage.html)
+  tags:
+    - Infrastructure
+  subTags:
+    - FinOps & Cost Management
+    - Monitoring & Alerting
+  ee: false
+  demo: false
